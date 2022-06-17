@@ -28,8 +28,8 @@ class State:
 class Playing:
     sound: Sound
     params: Params
-    start_time: msec
     _state: State
+    _start_position: msec
     _st_time_offset: float
     _stream: OutputStream
 
@@ -38,7 +38,7 @@ class Playing:
 class Pausing:
     sound: Sound
     params: Params
-    time: msec
+    position: msec
 
 
 def prepare(
@@ -51,7 +51,7 @@ def prepare(
     return Pausing(
         sound=sound,
         params=params,
-        time=start_time,
+        position=start_time,
     )
 
 
@@ -59,8 +59,8 @@ def start(pb: Pausing) -> Playing:
     pl = Playing(
         sound=pb.sound,
         params=pb.params,
-        start_time=pb.time,
-        _state=State(_start_frame(pb.sound, pb.time)),
+        _state=State(_pos2frame(pb.sound, pb.position)),
+        _start_position=pb.position,
         _st_time_offset=typing.cast(float, None),  # init later
         _stream=typing.cast(OutputStream, None),
     )
@@ -80,10 +80,10 @@ def start(pb: Pausing) -> Playing:
 
 
 def stop(pb: Playing) -> Pausing:
-    start_time = current_time(pb)
+    start_time = current_position(pb)
     stream = pb._stream
-    # if stream.active:
-    #     stream.stop()
+    if stream.active:
+        stream.stop()
     stream.close()
     return prepare(
         pb.sound.data,
@@ -98,10 +98,19 @@ def length(sound: Sound) -> msec:
     return msec(int(length))
 
 
-def current_time(pb: Playing) -> msec:
+def current_position(pb: Playing) -> msec:
     dt = (pb._stream.time - pb._st_time_offset) * 1000
-    time = msec(int(dt) + pb.start_time)
+    time = msec(int(dt) + pb._start_position)
     return min(time, length(pb.sound))
+
+
+def seek(pb: Playing, position: msec):
+    print("(pre) seek to ", position, " (len=", length(pb.sound))
+    position = max(msec(0), min(position, length(pb.sound)))
+    print("seek to ", position)
+    pb._start_position = position
+    pb._st_time_offset = pb._stream.time
+    pb._state.last_buffered_frame = _pos2frame(pb.sound, position)
 
 
 def _next_block(
@@ -122,25 +131,29 @@ def _next_block(
         state.last_buffered_frame += size
 
 
-def _start_frame(sound: Sound, start_time: msec) -> int:
-    frame = int(sound.sample_rate * start_time / 1000)
+def _pos2frame(sound: Sound, position: msec) -> int:
+    frame = int(sound.sample_rate * position / 1000)
     return max(0, min(frame, len(sound.data) - 1))
 
 
 if __name__ == "__main__":
-    sample = "./local/sample.wav"
+    sample = "./local/loretta.wav"
     audio, fs = soundfile.read(sample, always_2d=True)
     pb = prepare(audio, fs, start_time=msec(0), params=Params())
     pb = start(pb)
     while True:
         cmd = input("command > ")
         if cmd == "time" and isinstance(pb, Playing):
-            print("time: ", current_time(pb) / 1000, " [s]")
+            print("time: ", current_position(pb) / 1000, " [s]")
         if cmd == "stop" and isinstance(pb, Playing):
             pb = stop(pb)
-            print("stopped at: ", pb.time / 1000, " [s]")
+            print("stopped at: ", pb.position / 1000, " [s]")
         elif cmd == "start" and isinstance(pb, Pausing):
             pb = start(pb)
+        elif cmd == "seek5" and isinstance(pb, Playing):
+            seek(pb, msec(current_position(pb) + 5000))
+        elif cmd == "seek-5" and isinstance(pb, Playing):
+            seek(pb, msec(current_position(pb) - 5000))
         elif cmd == "quit":
             if isinstance(pb, Playing):
                 stop(pb)
