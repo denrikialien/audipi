@@ -117,6 +117,23 @@ def stop(pb: Playing) -> Pausing:
     )
 
 
+def set_marker(pb: Playing | Pausing, position: msec):
+    markers = pb.params.markers
+    ix = first_true(
+        range(len(markers)),
+        pred=lambda ix: markers[ix] >= position,
+        default=None,
+    )
+    if ix is None:
+        markers.append(position)
+    elif markers[ix] != position:
+        markers.insert(ix, position)
+
+
+def unset_marker(pb: Playing | Pausing, position: msec):
+    pb.params.markers.remove(position)
+
+
 def length(sound: Sound) -> msec:
     length = len(sound.data) / sound.sample_rate * 1000
     return msec(int(length))
