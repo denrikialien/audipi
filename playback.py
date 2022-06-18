@@ -129,6 +129,14 @@ def estimate_current_position(pb: Playing) -> msec | None:
     return _frame2pos(pb.sound, frame)
 
 
+def seek(pb: Pausing, duration: msec):
+    pb.position = np.clip(
+        msec(pb.position + duration),
+        msec(0),
+        length(pb.sound),
+    )
+
+
 def _estimate_current_frame(pb: Playing) -> int | None:
     state = pb._state
     if state is None:
@@ -175,7 +183,7 @@ def _fill_buffer(
 
 def _pos2frame(sound: Sound, position: msec) -> int:
     frame = int(sound.sample_rate * position / 1000)
-    return max(0, min(frame, len(sound.data) - 1))
+    return np.clip(frame, 0, len(sound.data) - 1)
 
 
 def _frame2pos(sound: Sound, frame: int) -> msec:
