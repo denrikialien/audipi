@@ -26,17 +26,15 @@ class Params:
 class State:
     buff_first_frame: int
     buff_last_frame: int
-    buff_output_time: float
+    buff_output_time: st_time
 
 
 @dataclass
 class Playing:
     sound: Sound
     params: Params
-    _state: State
-    _start_position: msec
-    _st_time_offset: float
     _stream: OutputStream
+    _state: State | None = None
 
 
 @dataclass
@@ -61,23 +59,38 @@ def prepare(
 
 
 def start(pb: Pausing) -> Playing:
-    pl = Playing(
+    _pb = Playing(
         sound=pb.sound,
         params=pb.params,
-        _state=State(
-            buff_last_frame=-1,
-            buff_first_frame=-1,
-            buff_output_time=-1.0,
-        ),
-        _start_position=pb.position,
         # init at the end of this function
-        _st_time_offset=typing.cast(float, None),
         _stream=typing.cast(OutputStream, None),
     )
 
-    def callback(dst: np.ndarray, block_size: int, time, _):
-        _next_block(pl.sound, pl.params, pl._state, block_size, dst)
-        pl._state.buff_output_time = time.outputBufferDacTime
+    def callback(buff: np.ndarray, buff_size: int, time, _):
+        first_frame = (
+            _pos2frame(_pb.sound, pb.position)
+            if _pb._state is None
+            else _pb._state.buff_last_frame + 1
+        )
+        last_frame, should_stop = _fill_buffer(
+            _pb.sound,
+            _pb.params,
+            first_frame,
+            buff_size,
+            buff,
+        )
+        if _pb._state is None:
+            _pb._state = State(
+                buff_first_frame=first_frame,
+                buff_last_frame=last_frame,
+                buff_output_time=time.outputBufferDacTime,
+            )
+        else:
+            _pb._state.buff_first_frame = first_frame
+            _pb._state.buff_last_frame = last_frame
+            _pb._state.buff_output_time = time.outputBufferDacTime
+        if should_stop:
+            raise CallbackStop()
 
     stream = OutputStream(
         samplerate=pb.sound.sample_rate,
@@ -85,13 +98,13 @@ def start(pb: Pausing) -> Playing:
         callback=callback,
     )
     stream.start()
-    pl._st_time_offset = stream.time
-    pl._stream = stream
-    return pl
+    _pb._stream = stream
+    return _pb
 
 
 def stop(pb: Playing) -> Pausing:
     start_time = estimate_current_position(pb)
+    assert start_time is not None
     stream = pb._stream
     if stream.active:
         stream.stop()
@@ -109,84 +122,55 @@ def length(sound: Sound) -> msec:
     return msec(int(length))
 
 
-def estimate_current_position(pb: Playing) -> msec:
-    return _frame2pos(pb.sound, _estimate_current_frame(pb))
+def estimate_current_position(pb: Playing) -> msec | None:
+    frame = _estimate_current_frame(pb)
+    if frame is None:
+        return None
+    return _frame2pos(pb.sound, frame)
 
 
-def _estimate_current_frame(pb: Playing) -> int:
-    dst = pb._state.buff_output_time - pb._stream.time
-    return pb._state.buff_first_frame - dst * pb.sound.sample_rate
+def _estimate_current_frame(pb: Playing) -> int | None:
+    state = pb._state
+    if state is None:
+        return None
+    dst = state.buff_output_time - pb._stream.time
+    return (
+        state.buff_first_frame - dst * pb.sound.sample_rate
+        if dst > 0.0
+        else None
+    )
 
 
-def seek(pb: Playing, position: msec):
-    position = max(msec(0), min(position, length(pb.sound)))
-    pb._start_position = position
-    pb._st_time_offset = pb._stream.time
-    pb._state.buff_last_frame = _pos2frame(pb.sound, position)
-
-
-def _next_block(
+def _fill_buffer(
     sound: Sound,
     params: Params,
-    state: State,
-    block_size: int,
-    dst: np.ndarray,
-):
-    first_frame = state.buff_last_frame + 1
+    first_frame: int,
+    buff_size: int,
+    buff: np.ndarray,
+) -> tuple[int, bool]:
     data = sound.data
-
-    # if params.loop:
-    #     left, right = _region(frame, params.markers, sound)
-    #     region = data[left : right + 1]
-    #     _next_block_looped(
-    #         region,
-    #         frame=frame - left,
-    #         size=block_size,
-    #         dst=dst,
-    #     )
-    #     state.next_buffered_frame = left + (frame + block_size) % len(
-    #         region
-    #     )
+    should_stop = False
 
     if params.loop:
         left, right = _region(first_frame, params.markers, sound)
-        size = min(block_size, right - first_frame + 1)
+        size = min(buff_size, right - first_frame + 1)
         last_frame = first_frame + size - 1
-        dst[:size] = data[first_frame : last_frame + 1]
-        if size < block_size:
-            # Expects that 'block_size' is sufficiently small
+        buff[:size] = data[first_frame : last_frame + 1]
+        if size < buff_size:
+            # Expects that 'buff_size' is sufficiently small
             # than the region's size.
-            last_frame = left + block_size - size - 1
-            dst[size:] = data[left : last_frame + 1]
-        state.buff_first_frame = first_frame
-        state.buff_last_frame = last_frame
+            last_frame = left + buff_size - size - 1
+            buff[size:] = data[left : last_frame + 1]
 
     else:
-        size = min(block_size, len(data) - first_frame)
+        size = min(buff_size, len(data) - first_frame)
         last_frame = first_frame + size - 1
-        dst[:size] = data[first_frame : last_frame + 1]
-        state.buff_first_frame = first_frame
-        state.buff_last_frame = last_frame
-        if size < block_size:
-            dst[size:] = 0
-            raise CallbackStop()
+        buff[:size] = data[first_frame : last_frame + 1]
+        if size < buff_size:
+            buff[size:] = 0
+            should_stop = True
 
-
-def _next_block_looped(
-    region: np.ndarray,
-    frame: int,
-    size: int,
-    dst: np.ndarray,
-):
-    chunk = min(size, len(region) - frame)
-    dst[:chunk] = region[frame : frame + chunk]
-    if size > chunk:
-        _next_block_looped(
-            region,
-            frame=0,
-            size=size - chunk,
-            dst=dst[chunk:],
-        )
+    return last_frame, should_stop
 
 
 def _pos2frame(sound: Sound, position: msec) -> int:
@@ -228,25 +212,23 @@ if __name__ == "__main__":
     pb = prepare(
         audio,
         fs,
-        start_time=msec(0),
-        params=Params(loop=True, markers=[msec(5000)]),
+        # start_time=msec(0),
+        start_time=msec(6000),
+        params=Params(loop=True, markers=[msec(5000), msec(10000)]),
+        # params=Params(loop=False, markers=[]),
     )
     pb = start(pb)
     while True:
         cmd = input("command > ")
         if cmd == "time" and isinstance(pb, Playing):
-            print(
-                "time: ", estimate_current_position(pb) / 1000, " [s]"
-            )
+            time = estimate_current_position(pb)
+            if time is not None:
+                print("time: ", time / 1000, " [s]")
         if cmd == "stop" and isinstance(pb, Playing):
             pb = stop(pb)
             print("stopped at: ", pb.position / 1000, " [s]")
         elif cmd == "start" and isinstance(pb, Pausing):
             pb = start(pb)
-        elif cmd == "seek5" and isinstance(pb, Playing):
-            seek(pb, msec(estimate_current_position(pb) + 5000))
-        elif cmd == "seek-5" and isinstance(pb, Playing):
-            seek(pb, msec(estimate_current_position(pb) - 5000))
         elif cmd == "quit":
             if isinstance(pb, Playing):
                 stop(pb)
