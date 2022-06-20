@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import NewType
-import typing
 from sounddevice import OutputStream, CallbackStop
+
 import soundfile
 import numpy as np
 from more_itertools import first_true
@@ -11,9 +11,14 @@ st_time = NewType("st_time", float)
 
 
 @dataclass
-class Sound:
+class Audio:
     data: np.ndarray
     sample_rate: float
+
+    @property
+    def length(self) -> msec:
+        length = len(self.data) / self.sample_rate * 1000
+        return msec(int(length))
 
 
 @dataclass
@@ -30,95 +35,87 @@ class State:
 
 
 @dataclass
-class Playing:
-    sound: Sound
-    params: Params
-    _stream: OutputStream
+class Playback:
+    _audio: Audio
+    _params: Params
+    _stream: OutputStream | None = None
     _state: State | None = None
 
 
-@dataclass
-class Pausing:
-    sound: Sound
-    params: Params
-    position: msec
+# @dataclass
+# class Pausing:
+#     sound: Sound
+#     params: Params
+#     position: msec
 
 
-def prepare(
+# def prepare(
+#     data: np.ndarray,
+#     sample_rate: float,
+#     start_time: msec,
+#     params: Params,
+# ) -> Pausing:
+#     sound = Sound(data, sample_rate)
+#     return Pausing(
+#         sound=sound,
+#         params=params,
+#         position=start_time,
+#     )
+
+
+def open(
     data: np.ndarray,
     sample_rate: float,
-    start_time: msec,
+    start_position: msec,
     params: Params,
-) -> Pausing:
-    sound = Sound(data, sample_rate)
-    return Pausing(
-        sound=sound,
-        params=params,
-        position=start_time,
-    )
-
-
-def start(pb: Pausing) -> Playing:
-    _pb = Playing(
-        sound=pb.sound,
-        params=pb.params,
-        # init at the end of this function
-        _stream=typing.cast(OutputStream, None),
-    )
+) -> Playback:
+    pb = Playback(_audio=Audio(data, sample_rate), _params=params)
+    assert 0 <= start_position <= pb._audio.length
 
     def callback(buff: np.ndarray, buff_size: int, time, _):
         first_frame = (
-            _pos2frame(_pb.sound, pb.position)
-            if _pb._state is None
-            else _pb._state.buff_last_frame + 1
+            _pos2frame(pb._audio, start_position)
+            if pb._state is None
+            else pb._state.buff_last_frame + 1
         )
-        last_frame, should_stop = _fill_buffer(
-            _pb.sound,
-            _pb.params,
+        last_frame, reached_end = _fill_buffer(
+            pb._audio,
+            pb._params,
             first_frame,
             buff_size,
             buff,
         )
-        if _pb._state is None:
-            _pb._state = State(
+        if pb._state is None:
+            pb._state = State(
                 buff_first_frame=first_frame,
                 buff_last_frame=last_frame,
                 buff_output_time=time.outputBufferDacTime,
             )
         else:
-            _pb._state.buff_first_frame = first_frame
-            _pb._state.buff_last_frame = last_frame
-            _pb._state.buff_output_time = time.outputBufferDacTime
-        if should_stop:
+            pb._state.buff_first_frame = first_frame
+            pb._state.buff_last_frame = last_frame
+            pb._state.buff_output_time = time.outputBufferDacTime
+        if reached_end:
             raise CallbackStop()
 
     stream = OutputStream(
-        samplerate=pb.sound.sample_rate,
-        channels=pb.sound.data.shape[1],
+        samplerate=pb._audio.sample_rate,
+        channels=pb._audio.data.shape[1],
         callback=callback,
     )
     stream.start()
-    _pb._stream = stream
-    return _pb
+    pb._stream = stream
+    return pb
 
 
-def stop(pb: Playing) -> Pausing:
-    start_time = estimate_current_position(pb)
-    assert start_time is not None
-    stream = pb._stream
-    if stream.active:
-        stream.stop()
-    stream.close()
-    return prepare(
-        pb.sound.data,
-        pb.sound.sample_rate,
-        start_time,
-        pb.params,
-    )
+def close(pb: Playback):
+    assert pb._stream is not None
+    pb._stream.close()
+    pb._stream = None
 
 
-def set_marker(pb: Playing | Pausing, position: msec):
-    markers = pb.params.markers
+def set_marker(pb: Playback, position: msec):
+    markers = pb._params.markers
     ix = first_true(
         range(len(markers)),
         pred=lambda ix: markers[ix] >= position,
@@ -130,60 +127,60 @@ def set_marker(pb: Playing | Pausing, position: msec):
         markers.insert(ix, position)
 
 
-def unset_marker(pb: Playing | Pausing, position: msec):
-    pb.params.markers.remove(position)
+def unset_marker(pb: Playback, position: msec):
+    pb._params.markers.remove(position)
 
 
-def length(sound: Sound) -> msec:
-    length = len(sound.data) / sound.sample_rate * 1000
-    return msec(int(length))
+def loop_on(pb: Playback):
+    pb._params.loop = True
 
 
-def estimate_current_position(pb: Playing) -> msec | None:
+def loop_off(pb: Playback):
+    pb._params.loop = False
+
+
+def _current_position(pb: Playback) -> msec | None:
     frame = _estimate_current_frame(pb)
     if frame is None:
         return None
-    return _frame2pos(pb.sound, frame)
+    return _frame2pos(pb._audio, frame)
 
 
-def seek(pb: Pausing, duration: msec):
-    pb.position = np.clip(
-        msec(pb.position + duration),
-        msec(0),
-        length(pb.sound),
-    )
+def playing(pb: Playback) -> bool:
+    return _current_position(pb) is not None
 
 
-def _estimate_current_frame(pb: Playing) -> int | None:
+def _estimate_current_frame(pb: Playback) -> int | None:
     state = pb._state
-    if state is None:
+    stream = pb._stream
+    if state is None or stream is None:
         return None
-    dst = state.buff_output_time - pb._stream.time
+    dst = state.buff_output_time - stream.time
     return (
-        state.buff_first_frame - dst * pb.sound.sample_rate
+        state.buff_first_frame - dst * pb._audio.sample_rate
         if dst > 0.0
         else None
     )
 
 
 def _fill_buffer(
-    sound: Sound,
+    sound: Audio,
     params: Params,
     first_frame: int,
     buff_size: int,
     buff: np.ndarray,
 ) -> tuple[int, bool]:
     data = sound.data
-    should_stop = False
+    reached_end = False
 
     if params.loop:
-        left, right = _region(first_frame, params.markers, sound)
+        left, right = _section(first_frame, params.markers, sound)
         size = min(buff_size, right - first_frame + 1)
         last_frame = first_frame + size - 1
         buff[:size] = data[first_frame : last_frame + 1]
         if size < buff_size:
             # Expects that 'buff_size' is sufficiently small
-            # than the region's size.
+            # than the size of the current section.
             last_frame = left + buff_size - size - 1
             buff[size:] = data[left : last_frame + 1]
 
@@ -193,22 +190,22 @@ def _fill_buffer(
         buff[:size] = data[first_frame : last_frame + 1]
         if size < buff_size:
             buff[size:] = 0
-            should_stop = True
+            reached_end = True
 
-    return last_frame, should_stop
+    return last_frame, reached_end
 
 
-def _pos2frame(sound: Sound, position: msec) -> int:
+def _pos2frame(sound: Audio, position: msec) -> int:
     frame = int(sound.sample_rate * position / 1000)
     return np.clip(frame, 0, len(sound.data) - 1)
 
 
-def _frame2pos(sound: Sound, frame: int) -> msec:
+def _frame2pos(sound: Audio, frame: int) -> msec:
     return msec(int(frame / sound.sample_rate * 1000))
 
 
-def _region(
-    frame: int, markers: list[msec], sound: Sound
+def _section(
+    frame: int, markers: list[msec], sound: Audio
 ) -> tuple[int, int]:
     if len(markers) == 0:
         return (0, len(sound.data) - 1)
@@ -231,30 +228,27 @@ def _region(
 
 
 if __name__ == "__main__":
-    # sample = "./local/sample.wav"
-    sample = "./local/loretta.wav"
+    sample = "./local/sample.wav"
+    # sample = "./local/loretta.wav"
     audio, fs = soundfile.read(sample, always_2d=True)
-    pb = prepare(
-        audio,
-        fs,
-        # start_time=msec(0),
-        start_time=msec(6000),
-        params=Params(loop=True, markers=[msec(5000), msec(10000)]),
-        # params=Params(loop=False, markers=[]),
-    )
-    pb = start(pb)
+
+    start_position = msec(0)
+    params = Params(loop=True, markers=[msec(5000), msec(10000)])
+    pb = open(audio, fs, start_position, params)
+
     while True:
         cmd = input("command > ")
-        if cmd == "time" and isinstance(pb, Playing):
-            time = estimate_current_position(pb)
+        if cmd == "time" and pb is not None:
+            time = _current_position(pb)
             if time is not None:
                 print("time: ", time / 1000, " [s]")
-        if cmd == "stop" and isinstance(pb, Playing):
-            pb = stop(pb)
-            print("stopped at: ", pb.position / 1000, " [s]")
-        elif cmd == "start" and isinstance(pb, Pausing):
-            pb = start(pb)
+        if cmd == "stop" and pb is not None:
+            start_position = _current_position(pb) or msec(0)
+            close(pb)
+            pb = None
+        elif cmd == "start" and pb is None:
+            pb = open(audio, fs, start_position, params)
         elif cmd == "quit":
-            if isinstance(pb, Playing):
-                stop(pb)
+            if pb is not None:
+                close(pb)
             break
