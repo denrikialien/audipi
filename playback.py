@@ -127,10 +127,8 @@ def _fill_buffer(
 
     if loop:
         left, right = audio.section_at(first_frame)
-        if right is None:
-            right = audio.frames - 1
-        if left is None:
-            left = 0
+        right = right or audio.frames - 1
+        left = left or 0
         size = min(buff_size, right - first_frame + 1)
         last_frame = first_frame + size - 1
         buff[:size] = data[first_frame : last_frame + 1]
