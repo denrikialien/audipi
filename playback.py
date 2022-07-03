@@ -53,11 +53,7 @@ class Playback:
             else state.buff_last_frame + 1
         )
         last_frame, reached_end = _fill_buffer(
-            buff,
-            buff_size,
-            first_frame,
-            self._loop,
-            self._audio,
+            buff, buff_size, first_frame, self._loop, self._audio
         )
         if state is None:
             self._state = _State(
@@ -150,8 +146,8 @@ def _fill_buffer(
 
 
 if __name__ == "__main__":
-    sample = "./local/sample.wav"
-    # sample = "./local/loretta.wav"
+    sample = "./tmp/sample.wav"
+    # sample = "./tmp/loretta.wav"
     data, fs = soundfile.read(sample, always_2d=True)
 
     start_position = msec(0)
